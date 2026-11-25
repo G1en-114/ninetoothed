@@ -275,7 +275,7 @@ def _domain(
             f"{result_shape}, expected {expected_kind}{expected_shape}."
         )
 
-    compatible, consumer_reason = _consumer_contract(
+    compatible, consumer_reason, store_constraints = _consumer_contract(
         result.name,
         users,
         axis=axis,
@@ -328,11 +328,51 @@ def _domain(
             result_dtype=result.type.dtype,
             store_shapes=store_shapes,
             program_shapes=program_shapes,
-            program_constraints=program_constraints,
+            program_constraints=tuple(
+                sorted({*program_constraints, *store_constraints})
+            ),
             program_compatible=program_compatible,
         ),
         rejection,
     )
+
+
+def _is_static_extent(extent: str) -> bool:
+    try:
+        int(extent)
+    except ValueError:
+        return False
+
+    return True
+
+
+def _symbolic_store_constraints(stored_shape, target_shape):
+    """Return runtime equalities that make a store shape-compatible, or None.
+
+    A tile view keeps each tensor's own size symbols, so ``out = f(x)`` over
+    ``x.tile((1, -1))`` / ``out.tile((1, -1))`` stores a value typed with
+    ``x``'s row extent into a target typed with ``out``'s row extent.  The
+    shapes only differ by symbol name, and agree whenever the launch shapes
+    agree.  Instead of rejecting the row-vector schedule for that, return one
+    ``((stored,), (target,))`` pair per differing symbolic extent so the
+    runtime validator can check equality at launch, exactly like the existing
+    program-domain constraints.  Static extents must still match exactly.
+    """
+    if len(stored_shape) != len(target_shape):
+        return None
+
+    constraints = []
+
+    for stored, target in zip(stored_shape, target_shape):
+        if stored == target:
+            continue
+
+        if _is_static_extent(stored) or _is_static_extent(target):
+            return None
+
+        constraints.append(((stored,), (target,)))
+
+    return tuple(constraints)
 
 
 def _consumer_contract(
@@ -359,6 +399,7 @@ def _consumer_contract(
         )
     ]
     seen = set()
+    store_constraints = set()
 
     while pending:
         value, broadcast_ready = pending.pop()
@@ -397,9 +438,19 @@ def _consumer_contract(
                         )
                     )
                 ):
-                    return False, (
-                        "store target does not match the reduction value domain"
+                    constraints = _symbolic_store_constraints(
+                        tuple(str(dim) for dim in stored_type.shape),
+                        tuple(str(dim) for dim in target_shape),
                     )
+
+                    if constraints is None:
+                        return (
+                            False,
+                            "store target does not match the reduction value domain",
+                            (),
+                        )
+
+                    store_constraints.update(constraints)
 
                 continue
 
@@ -407,8 +458,10 @@ def _consumer_contract(
                 continue
 
             if not _supported_consumer(operation.opcode) or not operation.results:
-                return False, (
-                    f"consumer `{operation.opcode}` is not row-vector compatible"
+                return (
+                    False,
+                    (f"consumer `{operation.opcode}` is not row-vector compatible"),
+                    (),
                 )
 
             if operation.opcode == "tensor.view":
@@ -422,7 +475,11 @@ def _consumer_contract(
                 view_contract = _broadcast_view_contract(operation, axis, source_shape)
 
                 if view_contract is None:
-                    return False, ("tensor view does not preserve the reduction domain")
+                    return (
+                        False,
+                        ("tensor view does not preserve the reduction domain"),
+                        (),
+                    )
 
                 consumer_broadcast_ready |= view_contract
 
@@ -430,10 +487,14 @@ def _consumer_contract(
                 shape = tuple(str(dim) for dim in consumer_result.type.shape)
 
                 if shape not in allowed_shapes:
-                    return False, "consumer shape is not in the reduction domain"
+                    return False, "consumer shape is not in the reduction domain", ()
 
                 if shape == input_shape and not consumer_broadcast_ready:
-                    return False, ("consumer broadcast does not preserve parallel axes")
+                    return (
+                        False,
+                        ("consumer broadcast does not preserve parallel axes"),
+                        (),
+                    )
 
                 pending.append(
                     (
@@ -442,7 +503,7 @@ def _consumer_contract(
                     )
                 )
 
-    return True, None
+    return True, None, tuple(sorted(store_constraints))
 
 
 def _reachable_stores(
