@@ -176,7 +176,9 @@ def _materialize(compilation):
         )
         wrapped = tuner
     elif candidate_launches:
-        wrapped = _verified_runtime_launch(candidate_launches[0])
+        wrapped = _verified_runtime_launch(
+            candidate_launches[0], abi=compilation.launch_abi
+        )
     else:
         wrapped = _verified_runtime_launch(
             _runtime_wrapper(
@@ -186,7 +188,8 @@ def _materialize(compilation):
                 device_types=runtime_device_types(compilation),
                 prepare_invocation=_triton_prepare_invocation(launch, kernel),
                 validate_bindings=validate_bindings,
-            )
+            ),
+            abi=compilation.launch_abi,
         )
 
     handle = Handle(compilation, kernel, wrapped, source)
@@ -234,6 +237,46 @@ def _candidate_launch(compilation, launch, kernel, candidate, validate_bindings)
         prepare_invocation=_triton_prepare_invocation(function, kernel),
         validate_bindings=validate_bindings,
     )
+
+
+@functools.lru_cache(maxsize=256)
+def _invocation_code(source):
+    """Compile a direct-invocation trampoline once per distinct source."""
+    return compile(source, "<ninetoothed-triton-invocation>", "exec")
+
+
+class _CapturingKernel:
+    """Stand-in for a Triton kernel that records ``kernel[grid](...)`` calls.
+
+    Captured calls live in a thread-local list, so concurrent dry launches of
+    the same handle from different threads do not see each other's calls.
+    """
+
+    __slots__ = ("_kernel", "_local")
+
+    def __init__(self, kernel):
+        import threading
+
+        self._kernel = kernel
+        self._local = threading.local()
+
+    def begin(self):
+        calls = []
+        self._local.calls = calls
+
+        return calls
+
+    def end(self):
+        self._local.calls = None
+
+    def __getitem__(self, grid):
+        bound_kernel = self._kernel[grid]
+        calls = self._local.calls
+
+        def capture(*args, **kwargs):
+            calls.append((bound_kernel, args, kwargs))
+
+        return capture
 
 
 def _triton_prepare_invocation(function, kernel):
@@ -350,37 +393,34 @@ def _triton_prepare_invocation(function, kernel):
         source = (
             "def invoke(_args, _kwargs):\n    _function(" + ", ".join(expressions) + ")"
         )
-        exec(compile(source, "<ninetoothed-triton-invocation>", "exec"), namespace)
+        exec(_invocation_code(source), namespace)
 
         return namespace["invoke"]
 
+    # The dry launch only swaps the kernel global for a capturing proxy, so
+    # build that function once instead of copying the module globals and
+    # defining a proxy class on every prepared launch.  A per-launch class is
+    # a reference cycle (class <-> methods) that pins the launch's tensors
+    # until the cyclic GC runs, which exhausts device memory in tight loops.
+    proxy = _CapturingKernel(kernel)
+    globals_copy = dict(target.__globals__)
+    globals_copy[kernel_name] = proxy
+    dry_launch = types.FunctionType(
+        target.__code__,
+        globals_copy,
+        target.__name__,
+        target.__defaults__,
+        target.__closure__,
+    )
+    dry_launch.__kwdefaults__ = target.__kwdefaults__
+
     def prepare(values, static_values=None, call_sources=None):
-        calls = []
+        calls = proxy.begin()
 
-        class KernelProxy:
-            def __getitem__(self, grid):
-                bound_kernel = kernel[grid]
-
-                def capture(*args, **kwargs):
-                    calls.append((bound_kernel, args, kwargs))
-
-                return capture
-
-        globals_copy = dict(target.__globals__)
-        globals_copy[kernel_name] = KernelProxy()
-        dry_launch = types.FunctionType(
-            target.__code__,
-            globals_copy,
-            target.__name__,
-            target.__defaults__,
-            target.__closure__,
-        )
-        dry_launch.__kwdefaults__ = target.__kwdefaults__
-        functools.partial(
-            dry_launch,
-            *partial_args,
-            **partial_keywords,
-        )(*values)
+        try:
+            dry_launch(*partial_args, *values, **partial_keywords)
+        finally:
+            proxy.end()
 
         if len(calls) != 1:
             return None
@@ -502,13 +542,19 @@ def _tuned_runtime_launch(
         _empty_launch,
         _first_output,
         _public_values,
+        _remember_structural_launch,
         _remember_verified_runtime_call,
         _runtime_call_identity,
+        _structural_call_key,
+        _structural_scalar_sources,
+        _structural_template,
     )
 
     active_identity = None
     active = None
     prepared_calls = {}
+    structural_launches = {}
+    structural_scalar_sources = _structural_scalar_sources(compilation.launch_abi)
 
     def evict(identity, token):
         nonlocal active, active_identity
@@ -547,7 +593,17 @@ def _tuned_runtime_launch(
 
         return prepared
 
-    def remember_best_effort(identity, selection_key, selected, prepared):
+    def remember_best_effort(
+        identity, selection_key, selected, prepared, structural_key=None
+    ):
+        if structural_key is not None:
+            template = _structural_template(prepared)
+
+            if template is not None:
+                _remember_structural_launch(
+                    structural_launches, structural_key, (selected, template)
+                )
+
         try:
             return remember(identity, selection_key, selected, prepared)
         except TypeError:
@@ -584,6 +640,21 @@ def _tuned_runtime_launch(
             activate(identity, cached)
 
             return cached[1]._ninetoothed_invoke_prepared(cached[2], args, kwargs)
+
+        structural_key = _structural_call_key(
+            compilation.launch_abi, structural_scalar_sources, args, kwargs
+        )
+        structural = (
+            structural_launches.get(structural_key)
+            if structural_key is not None
+            else None
+        )
+
+        if structural is not None:
+            selected, template = structural
+            record(selected)
+
+            return selected._ninetoothed_invoke_prepared(template, args, kwargs)
 
         public = _public_values(
             compilation.launch_abi,
@@ -636,6 +707,7 @@ def _tuned_runtime_launch(
                     selection_key,
                     selected,
                     prepared,
+                    structural_key,
                 )
 
             record(selected)
@@ -652,7 +724,9 @@ def _tuned_runtime_launch(
             except Exception:  # noqa: BLE001
                 return result
 
-            remember_best_effort(identity, selection_key, selected, prepared)
+            remember_best_effort(
+                identity, selection_key, selected, prepared, structural_key
+            )
 
             return result
 
@@ -670,7 +744,9 @@ def _tuned_runtime_launch(
             kwargs,
         )
         record(selected)
-        remember_best_effort(identity, selection_key, selected, prepared)
+        remember_best_effort(
+            identity, selection_key, selected, prepared, structural_key
+        )
 
         return result
 

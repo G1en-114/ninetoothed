@@ -907,6 +907,161 @@ def _runtime_call_identity(args, kwargs):
     return (len(args), *map(id, args), *map(id, kwargs.values()))
 
 
+_STRUCTURAL_LAUNCH_CACHE_SIZE = 16
+
+
+def _structural_scalar_sources(abi):
+    """Return public arguments whose *values* (not structure) reach the kernel."""
+    return frozenset(
+        binding.source
+        for binding in abi.kernel_args
+        if binding.kind in {"scalar", "constexpr", "meta"}
+        or binding.kind.startswith("jagged_")
+    )
+
+
+def _structural_call_key(abi, scalar_sources, args, kwargs):
+    """Return a pointer-independent key for a call, or ``None`` if unsafe.
+
+    The verified call cache above is keyed by tensor object identity, so a
+    caller that allocates a fresh output per call (``out = torch.empty_like(x)``)
+    never hits it and re-runs the full launch preparation on every call.  A
+    launch whose kernel arguments are only tensors (passed through from the
+    call) plus values derived from shapes and strides is fully determined by
+    this key: each tensor's type, shape, strides, dtype and device, each
+    literal argument's value, and which tensor arguments overlap in memory
+    (aliasing changes autotuning and in-place semantics).  The storage offset
+    is deliberately excluded: the kernel only sees the offset-adjusted data
+    pointer, so differently offset views (``x[i]`` in a loop) reuse one plan.
+    Tensors bound to scalar, meta or jagged parameters contribute their
+    contents, so such calls are never keyed.
+    """
+    names = abi.public_args
+    positional = len(args)
+    parts = [positional]
+    spans = []
+
+    for index, value in enumerate((*args, *kwargs.values()) if kwargs else args):
+        name = names[index] if index < positional else None
+        stride = getattr(value, "stride", None)
+
+        if callable(stride) and hasattr(value, "dtype") and hasattr(value, "shape"):
+            if name is None:
+                name = tuple(kwargs)[index - positional]
+
+            if name in scalar_sources:
+                return None
+
+            try:
+                shape = tuple(value.shape)
+                strides = tuple(stride())
+                device = value.device
+                # No storage offset: kernels receive the offset-adjusted data
+                # pointer, and no shape/stride-derived binding depends on it,
+                # so views of one storage at different offsets share a plan.
+                parts.append((name, type(value), shape, strides, value.dtype, device))
+                spans.append(
+                    _structural_memory_span(
+                        device, shape, strides, value.data_ptr(), value.element_size()
+                    )
+                )
+            except (AttributeError, RuntimeError, TypeError):
+                return None
+
+            continue
+
+        if name is None:
+            name = tuple(kwargs)[index - positional]
+
+        if not _is_cacheable_runtime_literal(value):
+            return None
+
+        parts.append((name, type(value), _runtime_literal_key(value)))
+
+    if len(spans) < 2:
+        return (*parts, ())
+
+    overlaps = tuple(
+        (first, second)
+        for first in range(len(spans))
+        for second in range(first + 1, len(spans))
+        if _structural_spans_overlap(spans[first], spans[second])
+    )
+
+    return (*parts, overlaps)
+
+
+def _structural_memory_span(device, shape, strides, data_ptr, element_size):
+    """Byte span of a tensor, as ``layout_runtime.tensor_memory_span`` computes it.
+
+    Reuses the shape and strides already read for the structural key.
+    """
+    if 0 in shape:
+        return (device, 0, 0)
+
+    lower = upper = 0
+
+    for size, stride in zip(shape, strides):
+        extent = (size - 1) * stride
+
+        if extent < 0:
+            lower += extent
+        else:
+            upper += extent
+
+    return (
+        device,
+        data_ptr + lower * element_size,
+        data_ptr + (upper + 1) * element_size,
+    )
+
+
+def _structural_spans_overlap(first, second):
+    """Apply ``layout_runtime.memory_spans_overlap``'s conservative test."""
+    if first[0] is not None and second[0] is not None and first[0] != second[0]:
+        return False
+
+    if first[1] == first[2] or second[1] == second[2]:
+        return False
+
+    return first[1] < second[2] and second[1] < first[2]
+
+
+def _structural_template(prepared):
+    """Strip a prepared launch to the pointer-independent part, if reusable.
+
+    Only launches whose invocation plan reads every tensor straight from the
+    call arguments (no captured tensor values) can be replayed for another
+    call with the same structural key.
+    """
+    if prepared is None or not prepared.guard.cacheable:
+        return None
+
+    if prepared.empty:
+        return replace(prepared, binding_plan=None, owner_refs=(), cache_token=None)
+
+    plan = prepared.invocation_plan
+
+    if plan is None or getattr(plan, "requires_values", True):
+        return None
+
+    binding_plan = prepared.binding_plan
+
+    if binding_plan is None or binding_plan.jagged_owners:
+        return None
+
+    return replace(prepared, binding_plan=None, owner_refs=(), cache_token=None)
+
+
+def _remember_structural_launch(cache, key, entry):
+    cache.pop(key, None)
+
+    if len(cache) >= _STRUCTURAL_LAUNCH_CACHE_SIZE:
+        cache.pop(next(iter(cache)))
+
+    cache[key] = entry
+
+
 def _two_tensor_call_identity(call_key):
     return (call_key[3], call_key[11], call_key[1], call_key[2])
 
@@ -973,10 +1128,19 @@ def _arm_prepared_runtime_launch(prepared, callback, token):
     )
 
 
-def _verified_runtime_launch(launch):
+def _verified_runtime_launch(launch, abi=None):
+    """Wrap ``launch`` with verified prepared-call caches.
+
+    With ``abi``, calls that miss the identity cache also consult a
+    pointer-independent structural cache (see ``_structural_call_key``).
+    """
     active_identity = None
     active = None
     prepared_calls = {}
+    structural_launches = {}
+    structural_scalar_sources = (
+        _structural_scalar_sources(abi) if abi is not None else frozenset()
+    )
 
     def evict(identity, token):
         nonlocal active, active_identity
@@ -1052,7 +1216,29 @@ def _verified_runtime_launch(launch):
 
             return cached.invoker(cached, args, kwargs)
 
+        structural_key = (
+            _structural_call_key(abi, structural_scalar_sources, args, kwargs)
+            if abi is not None
+            else None
+        )
+        template = (
+            structural_launches.get(structural_key)
+            if structural_key is not None
+            else None
+        )
+
+        if template is not None:
+            return template.invoker(template, args, kwargs)
+
         prepared = launch._ninetoothed_prepare(args, kwargs)
+
+        if structural_key is not None:
+            template = _structural_template(prepared)
+
+            if template is not None:
+                _remember_structural_launch(
+                    structural_launches, structural_key, template
+                )
         cached_prepared = remember(
             _two_tensor_call_identity(prepared.guard.two_tensor_state)
             if prepared.guard.two_tensor_state is not None
