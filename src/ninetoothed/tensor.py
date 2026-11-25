@@ -1,3 +1,4 @@
+import contextvars
 import copy
 import functools
 import itertools
@@ -6,6 +7,36 @@ import re
 
 import ninetoothed.naming as naming
 from ninetoothed.symbol import Symbol
+
+#: Rows per tile substituted for unit-row tiles while the compiler re-arranges
+#: a row reduction (see ``ninetoothed.compiler.row_coarsening``); ``None``
+#: outside that compilation.
+ROW_COARSENING = contextvars.ContextVar("ninetoothed_row_coarsening", default=None)
+
+
+def _coarsened_tile_shape(tensor, tile_shape, strides, dilation, floor_mode):
+    """Widen ``root.tile((1, w))`` / ``root.tile((1,))`` to ``rows`` rows.
+
+    Only active while the compiler re-arranges a row reduction; the leading
+    axis of a root tensor is the row axis, for both the reduced 2-D input and
+    a per-row 1-D output.
+    """
+    rows = ROW_COARSENING.get()
+
+    if (
+        rows is None
+        or tensor.source is not tensor
+        or tensor.ndim not in (1, 2)
+        or strides is not None
+        or dilation is not None
+        or floor_mode
+        or len(tile_shape) != tensor.ndim
+        or type(tile_shape[0]) is not int
+        or tile_shape[0] != 1
+    ):
+        return tile_shape
+
+    return (rows, *tile_shape[1:])
 
 
 class _SourceIdentity:
@@ -257,6 +288,10 @@ class Tensor:
             compute the outer shape.
         :return: A hierarchical tensor.
         """
+        tile_shape = _coarsened_tile_shape(
+            self, tile_shape, strides, dilation, floor_mode
+        )
+
         if strides is None:
             strides = [-1 for _ in tile_shape]
 

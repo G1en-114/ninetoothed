@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 
+from ninetoothed.backends.core import Target
 from ninetoothed.compiler.passes import HARDWARE_INDEPENDENT, Pass
 from ninetoothed.compiler.reduction_geometry import reduction_inputs_share_domain
 
@@ -113,9 +114,15 @@ class GroupReductionRows(Pass):
                 reason = "requires a whole-output store domain"
             elif any(output in op.operands for op in operations[:-1]):
                 reason = "output is also read"
-            elif tuple(map(str, values[output].type.shape)) != tuple(
-                reduction.get("value_shape", ())
-            ):
+            elif tuple(map(str, values[output].type.shape)) not in {
+                tuple(reduction.get("value_shape", ())),
+                *(
+                    # Triton's block lowering stores per-row results directly.
+                    (tuple(reduction.get("result_shape", ())),)
+                    if context.resolved_target.backend == Target.TRITON
+                    else ()
+                ),
+            }:
                 reason = "requires output to match the reduction input domain"
             elif not reduction_inputs_share_domain(
                 operations,

@@ -98,7 +98,11 @@ class Compiler:
     """Facade for pure SSA compilation and optional runtime materialization."""
 
     def compile(self, request: CompileRequest) -> Compilation:
-        return _compile_kernel(request, module=self.frontend(request))
+        from ninetoothed.compiler.row_coarsening import coarsen_row_reductions
+
+        compilation = _compile_kernel(request, module=self.frontend(request))
+
+        return coarsen_row_reductions(self, request, compilation) or compilation
 
     def frontend(self, request: CompileRequest) -> FrontendModule:
         """Freeze a Python application into verified, target-neutral IR."""

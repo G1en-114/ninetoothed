@@ -4452,6 +4452,14 @@ def _store_index(op: ssa.Operation, ctx: _EmitContext) -> str:
 
         return _linearized_index(coords, axes) if coords else "0"
 
+    if ctx.block_program:
+        axes = _value_axes(op.operands[1], ctx)
+
+        # A row-grouped block may store per-row results, e.g. a (rows,) sum
+        # of a (rows, width) block; index the target by its own block axes.
+        if axes and axes != tuple(str(axis) for axis in ctx.output_axes):
+            return _linearized_index(_current_coords(axes, ctx), axes)
+
     if ctx.block_program and ctx.coordinate_exprs:
         return _linearized_index(ctx.coordinate_exprs, ctx.output_axes)
     return ctx.index_expr
