@@ -1341,9 +1341,16 @@ def _emit_value(name: str, ctx: _EmitContext) -> str:
                 )
 
                 if mask is not None:
-                    identity = _reduction_identity(
-                        operator, op.results[0].type, ctx.target
-                    )
+                    if op.results[0].type.dtype is None:
+                        # Resolve the identity from the operand at JIT time so
+                        # integer inputs are not promoted by a float literal.
+                        identity = ctx.target.reduction_identity(
+                            f"({operand}).dtype", operator, "()"
+                        )
+                    else:
+                        identity = _reduction_identity(
+                            operator, op.results[0].type, ctx.target
+                        )
                     operand = ctx.target.where(mask, operand, identity)
 
             axis = int(op.attrs.get("axis", 0) or 0)

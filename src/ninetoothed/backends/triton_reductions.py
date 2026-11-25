@@ -202,7 +202,9 @@ def _rejection(
         shape = values[op.operands[0]].type.shape
         axis = op.attrs.get("axis")
 
-        if normalize_dtype(op.results[0].type.dtype) != "float32":
+        # An unresolved dtype is emitted with a dtype-generic identity, like
+        # the row-vector path; other concrete dtypes stay unsupported.
+        if normalize_dtype(op.results[0].type.dtype) not in {None, "float32"}:
             return "requires FP32 reduction results"
 
         if isinstance(axis, bool) or not isinstance(axis, int):
