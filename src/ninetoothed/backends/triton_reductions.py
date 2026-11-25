@@ -90,11 +90,19 @@ def analyze_block_reductions(program, context, *, allow_row_vector=False):
         program, context, schedule, allow_row_vector=allow_row_vector, **limits
     )
 
-    return {
+    result = {
         "enabled": reason is None,
         "reason": reason or "bounded straight-line reduction graph",
         **limits,
     }
+
+    if reason is None:
+        constraints = _per_dimension_constraints(program, context)
+
+        if constraints:
+            result["program_constraints"] = constraints
+
+    return result
 
 
 def _rejection(
@@ -205,6 +213,9 @@ def _rejection(
 
     tensors = {tensor.name: tensor for tensor in context.tensors}
     outer_sizes = set()
+    validated_domains = (
+        _validated_program_domains(reduction) if allow_row_vector else frozenset()
+    )
 
     for value in program.inputs:
         if value.type.kind != "tensor":
@@ -216,9 +227,16 @@ def _rejection(
         if layout is None or len(layout.levels) != 1 or tensor.jagged_dim is not None:
             return "requires a single-level dense arranged layout"
 
-        outer = _static_shape(tuple(axis.render() for axis in layout.view_shape))
+        rendered = tuple(axis.render() for axis in layout.view_shape)
+        outer = _static_shape(rendered)
 
         if outer is None:
+            # A symbolic outer domain is legal when the row-vector schedule's
+            # launch-time validator already proves it equal to the others.
+            if _canonical_domain(rendered) in validated_domains:
+                outer_sizes.add(validated_domains)
+                continue
+
             return "requires a static outer program domain"
 
         outer_sizes.add(prod(outer))
@@ -233,6 +251,87 @@ def _rejection(
         return "store value must match the arranged output shape"
 
     return None
+
+
+def _per_dimension_constraints(program, context):
+    """Equate symbolic outer domains of equal rank dimension by dimension.
+
+    Block programs decompose the program id with each tensor's own outer
+    shape, so equal products are not enough: ``(2, 50)`` and ``(100, 1)``
+    would map one program to different tiles.  Static domains were already
+    compared exactly; each symbolic same-rank domain is paired with the
+    first one, one ``((a,), (b,))`` constraint per differing dimension, for
+    the launch-time validator.
+    """
+    tensors = {tensor.name: tensor for tensor in context.tensors}
+    domains = []
+
+    for value in program.inputs:
+        tensor = tensors.get(value.name)
+
+        if value.type.kind != "tensor" or tensor is None or tensor.layout is None:
+            continue
+
+        rendered = tuple(axis.render() for axis in tensor.layout.view_shape)
+
+        if _static_shape(rendered) is None:
+            domains.append(rendered)
+
+    constraints = []
+
+    for reference in domains[:1]:
+        for domain in domains[1:]:
+            if len(domain) != len(reference):
+                continue
+
+            constraints.extend(
+                ((actual,), (expected,))
+                for actual, expected in zip(domain, reference)
+                if _canonical_domain((actual,)) != _canonical_domain((expected,))
+            )
+
+    return tuple(constraints)
+
+
+def _canonical_domain(shape):
+    import sympy
+
+    try:
+        return tuple(sympy.simplify(sympy.sympify(str(axis))) for axis in shape)
+    except (sympy.SympifyError, TypeError):
+        return tuple(str(axis) for axis in shape)
+
+
+def _validated_program_domains(reduction):
+    """Return outer domains equated by the row-vector launch validator.
+
+    ``program_constraints`` pairs are checked at every launch (see the
+    Triton materializer's row-vector validator), so all domains that appear
+    in one connected set of constraints are equal whenever the kernel runs.
+    Only a single connected set proves one shared domain; otherwise nothing
+    is returned and symbolic domains stay rejected.
+    """
+    if reduction.get("mode") != "row-vector":
+        return frozenset()
+
+    constraints = tuple(reduction.get("program_constraints", ()))
+
+    if not constraints:
+        return frozenset()
+
+    groups = []
+
+    for actual, expected in constraints:
+        pair = {_canonical_domain(actual), _canonical_domain(expected)}
+        merged = [group for group in groups if group & pair]
+
+        for group in merged:
+            groups.remove(group)
+            pair |= group
+
+        groups.append(pair)
+
+    return frozenset(groups[0]) if len(groups) == 1 else frozenset()
 
 
 def _static_shape(shape):

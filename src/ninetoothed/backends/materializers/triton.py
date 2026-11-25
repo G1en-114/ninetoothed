@@ -838,7 +838,14 @@ def _runtime_vector_validator(compilation):
             tuple(sympy.sympify(str(value)) for value in actual),
             tuple(sympy.sympify(str(value)) for value in expected),
         )
-        for actual, expected in reduction.get("program_constraints", ())
+        for actual, expected in (
+            *reduction.get("program_constraints", ()),
+            *(
+                schedule.get("row_group", {}).get("program_constraints", ())
+                if schedule.get("row_group", {}).get("enabled")
+                else ()
+            ),
+        )
     )
     expressions = (
         extent_expression,
